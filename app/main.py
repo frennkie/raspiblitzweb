@@ -1,48 +1,17 @@
+import asyncio
 from enum import Enum
 from typing import Optional
 
 from aioredis import Channel, Redis
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.params import Depends, Header
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.templating import Jinja2Templates
 from fastapi_plugins import depends_redis, redis_plugin
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from starlette.responses import HTMLResponse
 
-html = """
-<!DOCTYPE html>
-<html>
-    <head>
-        <title>SSE</title>
-    </head>
-    <body>
-    
-      <h1>Getting server updates</h1>
-      <div id="result"></div>
-        
-      <script>
-          if(typeof(EventSource) !== "undefined") {
-              const evtSource = new EventSource("http://localhost:8000/sse/stream");              
-              evtSource.addEventListener("message", function(event) {
-              // Logic to handle status updates
-              console.log(event.data);
-            
-              try{ 
-                  console.log(JSON.parse(event.data)); 
-              } catch(e) { 
-                  document.getElementById("result").innerHTML += "ERROR: Caught: " + e.message + " --- ";
-              }
-                   
-              document.getElementById("result").innerHTML += event.data + "<br>";            
-            
-          });              
-          } else {
-              document.getElementById("result").innerHTML = "Sorry, your browser does not support server-sent events.";
-          }
-      </script>
-    </body>
-</html>
-"""
 
 tags_metadata = [
     {
@@ -66,6 +35,10 @@ app = FastAPI(
     version="0.1"
 )
 
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+templates = Jinja2Templates(directory="templates")
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -79,8 +52,8 @@ async def on_shutdown() -> None:
 
 
 @app.get("/sse/demo", tags=["demo"])
-async def demo():
-    return HTMLResponse(html)
+async def demo(request: Request):
+    return templates.TemplateResponse("demo.html", {"request": request})
 
 
 @app.get("/sse/publish", tags=["demo"])
@@ -91,17 +64,77 @@ async def publish(channel: str = "default", redis: Redis = Depends(depends_redis
 
 @app.get("/sse/stream", tags=["demo"])
 async def stream(channel: str = "default", redis: Redis = Depends(depends_redis),
+                 request: Request = None,
                  accept: str = Header(None)):
     if "text/event-stream" not in accept:
-        return HTMLResponse("<!DOCTYPE html><html><title></title><body>SSE only!</body></html>")
+        return templates.TemplateResponse("sse_only.html", {"request": request})
 
+    print(f"running stream(): {request}")
     return EventSourceResponse(subscribe(channel, redis))
 
 
 async def subscribe(channel: str, redis: Redis):
     (channel_subscription,) = await redis.subscribe(channel=Channel(channel, False))
+    print("subscribe called")
+
     while await channel_subscription.wait_message():
-        yield {"event": "message", "data": await channel_subscription.get(encoding='utf-8')}
+
+        data = await channel_subscription.get(encoding='utf-8')
+        print(f"data: {data}")
+
+        yield {"event": "message", "data": data}
+
+MESSAGE_STREAM_DELAY = 1  # second
+MESSAGE_STREAM_RETRY_TIMEOUT = 15000  # millisecond
+
+COUNT = 0
+
+
+def increment():
+    global COUNT
+    COUNT = COUNT+1
+
+
+messages = [
+    ("message", "foo"),
+    ("message", "bar"),
+    ("message", "foobar"),
+    ("new_message", "honk"),
+    ("new_message", "honk hase"),
+]
+
+
+@app.get("/events")
+async def stream(request: Request, accept: str = Header(None)):
+    if "text/event-stream" not in accept:
+        return templates.TemplateResponse("sse_only.html", {"request": request})
+
+    # return EventSourceResponse()
+    def new_messages():
+        print(f"checking for messages: {len(messages)}")
+        return len(messages)
+
+    async def event_generator():
+        while True:
+            # If client was closed the connection
+            if await request.is_disconnected():
+                break
+
+            # Checks for new messages and return them to client if any
+            if new_messages():
+                # msg = messages[(randint(0, len(messages) - 1))]
+                msg = messages.pop()
+                increment()
+                yield {
+                        "event": msg[0],
+                        "id": COUNT,
+                        "retry": MESSAGE_STREAM_RETRY_TIMEOUT,
+                        "data": msg[1]
+                }
+
+            await asyncio.sleep(MESSAGE_STREAM_DELAY)
+
+    return EventSourceResponse(event_generator())
 
 
 class ReceiveType(str, Enum):
@@ -109,16 +142,14 @@ class ReceiveType(str, Enum):
     onchain = "onchain"
 
 
-class BaseReceive(BaseModel):
-    type: ReceiveType = ReceiveType.lightning
-
-
-class ReceiveIn(BaseReceive):
+class ReceiveIn(BaseModel):
+    type: ReceiveType = ReceiveType.lightning  # can be factored out into a BaseReceive
     amount: Optional[int] = Field(..., description="Amount in SATs (or in mSATs?!)", ge=0)
     comment: Optional[str]
 
 
-class ReceiveOut(BaseReceive):
+class ReceiveOut(BaseModel):
+    type: ReceiveType = ReceiveType.lightning
     data: str = Field(..., description="Address or Invoice")
 
 
@@ -134,9 +165,9 @@ async def receive_funds(obj: ReceiveIn):
     """
 
     if obj.type == ReceiveType.onchain:
-        return {"type": obj.type, "data": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"}
+        return ReceiveOut(type=obj.type, data="bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
     else:
-        return {"type": obj.type, "data": "lntb1u1pwz5w78pp5e8w8cr5c30xzws92v3"}
+        return {"type": obj.type, "data": "lntb1u1pwz5w78pp5e8w8cr5c30xzws92v3"}  # same as using the ReceiveOut model
 
 
 @app.post("/send")
@@ -155,7 +186,8 @@ async def reboot():
 
 
 @app.post("/shutdown", tags=["system"])
-async def shutdown():
+async def shutdown(token: str = Depends(oauth2_scheme)):
+    print(f"Token: {token}")
     return {"status": "success"}
 
 
@@ -171,6 +203,8 @@ async def show_app_status():
 
 @app.get("/apps", summary="List info about Apps. (Supports SSE)", tags=["apps"])
 async def apps():
+    print("appending message")
+    messages.append(("message", "yeah"))
     return
 
 

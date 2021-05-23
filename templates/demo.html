@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>SSE</title>
+</head>
+<body>
+
+<h1>Getting server updates</h1>
+<div id="result"></div>
+
+<script>
+    if (typeof (EventSource) !== "undefined") {
+        const evtSourceDemo = new EventSource("{{ request.base_url }}sse/stream");
+
+        evtSourceDemo.onmessage = (event) => {
+            // Do something - event data etc will be in e.data
+            console.log(event.data);
+        };
+
+        evtSourceDemo.addEventListener("message", function (event) {
+            // Logic to handle status updates
+            console.log("Received type: Demo message");
+            console.log(event);
+            console.log(event.data);
+        });
+
+        const evtSource = new EventSource("http://localhost:8000/events");
+
+        evtSource.addEventListener("new_message", function (event) {
+            // Logic to handle status updates
+            console.log("Received type: new_message");
+            console.log(event);
+            console.log(event.data);
+        });
+
+        evtSource.addEventListener("message", function (event) {
+            // Logic to handle status updates
+            console.log("Received type: message");
+            console.log(event);
+            console.log(event.data);
+
+            try {
+                console.log(JSON.parse(event.data));
+            } catch (e) {
+                document.getElementById("result").innerHTML += "ERROR: Caught: " + e.message + " --- ";
+            }
+
+            document.getElementById("result").innerHTML += event.data + "<br>";
+
+        });
+    } else {
+        document.getElementById("result").innerHTML = "Sorry, your browser does not support server-sent events.";
+    }
+</script>
+</body>
+</html>
