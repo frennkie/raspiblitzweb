@@ -24,7 +24,7 @@
             console.log(event.data);
         });
 
-        const evtSource = new EventSource("http://localhost:8000/events");
+        const evtSource = new EventSource("{{ request.base_url }}events");
 
         evtSource.addEventListener("new_message", function (event) {
             // Logic to handle status updates
